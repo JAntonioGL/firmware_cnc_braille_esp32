@@ -1,92 +1,121 @@
 #include <Arduino.h>
-#include <vector>
-#include <string>
-#include "braille_lib.h"
+#include "Braille.h"
+#include "Translator.h"
 
-// Variables para almacenar las dimensiones y el mensaje del usuario
-int brailleMaxRows;
-int brailleMaxCols;
-std::string userMessage;
 
-// Enum para controlar el estado del programa
-enum State {
-  WAITING_FOR_ROWS,
-  WAITING_FOR_COLS,
-  WAITING_FOR_TEXT,
-  PROCESSING_TEXT
-};
+// ==== pega aquí la Biblioteca Braille y las funciones brailleLookup/traducirBraille de arriba ====
 
-// Variable para rastrear el estado actual
-State currentState = WAITING_FOR_ROWS;
+static const unsigned long BAUD = 115200;
+
+// Utilidad sencilla para recortar fin de línea
+String rtrim(const String& s) {
+  int end = s.length();
+  while (end > 0 && (s[end-1] == '\r' || s[end-1] == '\n')) end--;
+  return s.substring(0, end);
+}
 
 void setup() {
-    Serial.begin(115200);
-    // Agregamos un pequeño retraso para asegurar que la conexión serial esté lista
-    delay(1000); 
+  Serial.begin(BAUD);
+  while (!Serial) {}
+  Serial.println(F("Listo. Protocolo:"));
+  Serial.println(F("  CELLS M N"));
+  Serial.println(F("  <M lineas de texto (con o sin \\n)>"));
+  Serial.println(F("  END"));
+  Serial.println(F("Ejemplo:"));
+  Serial.println(F("  CELLS 1 10"));
+  Serial.println(F("  HOLA MUNDO"));
+  Serial.println(F("  END"));
+}
 
-    Serial.println("Listo para recibir la configuracion.");
-    Serial.println("Ingresa el numero maximo de FILAS y presiona Enter:");
+bool leerCabecera(size_t& M, size_t& N) {
+  // Espera una línea que comience con "CELLS "
+  while (Serial.available() == 0) { delay(5); }
+  String header = rtrim(Serial.readStringUntil('\n'));
+  header.trim();
+  if (!header.startsWith("CELLS")) return false;
+
+  // Parsear
+  int i1 = header.indexOf(' ');
+  int i2 = header.indexOf(' ', i1+1);
+  if (i1 < 0 || i2 < 0) return false;
+  String sM = header.substring(i1+1, i2);
+  String sN = header.substring(i2+1);
+  M = (size_t) sM.toInt();
+  N = (size_t) sN.toInt();
+  return (M > 0 && N > 0);
 }
 
 void loop() {
-    // Comprueba si hay datos disponibles en el puerto serial
-    if (Serial.available() > 0) {
-        String inputString = Serial.readStringUntil('\n');
-        std::string cppInputString = inputString.c_str();
+  if (Serial.available() == 0) { delay(10); return; }
 
-        // Limpia la entrada para evitar espacios en blanco
-        size_t firstChar = cppInputString.find_first_not_of(" \t\r\n");
-        if (std::string::npos == firstChar) {
-            return; // No hace nada si la entrada está vacía
-        }
-        
-        switch (currentState) {
-            case WAITING_FOR_ROWS:
-                brailleMaxRows = std::stoi(cppInputString);
-                Serial.println("Numero de filas recibido.");
-                Serial.println("Ingresa el numero maximo de COLUMNAS y presiona Enter:");
-                currentState = WAITING_FOR_COLS;
-                break;
-                
-            case WAITING_FOR_COLS:
-                brailleMaxCols = std::stoi(cppInputString);
-                Serial.println("Numero de columnas recibido.");
-                Serial.println("Ahora, ingresa el MENSAJE y presiona Enter:");
-                currentState = WAITING_FOR_TEXT;
-                break;
-                
-            case WAITING_FOR_TEXT:
-                userMessage = cppInputString;
-                currentState = PROCESSING_TEXT;
-                break;
-                
-            case PROCESSING_TEXT:
-                // Las variables ya fueron recibidas, ahora procesamos la solicitud
-                // Crea la matriz con las dimensiones especificadas
-                std::vector<std::vector<BraillePointState>> brailleSheet(brailleMaxRows * 3, std::vector<BraillePointState>(brailleMaxCols * 2));
+  size_t M=0, N=0;
+  if (!leerCabecera(M, N)) {
+    Serial.println(F("Error: cabecera invalida. Usa 'CELLS M N'"));
+    // Leer hasta END para limpiar
+    while (Serial.available()) { Serial.read(); }
+    return;
+  }
 
-                // Llama a la funcion de la biblioteca para llenar la matriz
-                translateToBrailleMatrix(userMessage, brailleSheet);
-                
-                // Imprime UNICAMENTE la matriz braille en el monitor serial
-                for (int i = 0; i < brailleMaxRows * 3; ++i) {
-                    for (int j = 0; j < brailleMaxCols * 2; ++j) {
-                        Serial.print(brailleSheet[i][j] == BRAILLE_HIGH ? 'o' : '.');
-                        if ((j + 1) % 2 == 0) {
-                            Serial.print(' ');
-                        }
-                    }
-                    Serial.println();
-                    if ((i + 1) % 3 == 0) {
-                        Serial.println();
-                    }
-                }
-                
-                // Resetea el estado para un nuevo ciclo
-                Serial.println("---");
-                Serial.println("Procesado. Ingresa el numero maximo de FILAS para empezar de nuevo:");
-                currentState = WAITING_FOR_ROWS;
-                break;
-        }
+  // Reservar matriz_texto MxN (linealizada)
+  char* matriz_texto = (char*) malloc(M*N);
+  if (!matriz_texto) {
+    Serial.println(F("Error: sin memoria para matriz_texto."));
+    return;
+  }
+
+  // Leer lineas hasta END (se esperan al menos M lineas de texto)
+  size_t lineasLeidas = 0;
+  while (true) {
+    while (Serial.available() == 0) { delay(5); }
+    String line = rtrim(Serial.readStringUntil('\n'));
+    if (line == "END") break;
+
+    // Si AÚN no completamos M filas, copiamos la línea a la fila actual
+    if (lineasLeidas < M) {
+      // Rellenar con espacios
+      char* row = matriz_texto + (lineasLeidas * N);
+      for (size_t j=0; j<N; ++j) row[j] = ' ';
+      // Copiar hasta N chars de la linea
+      size_t len = (size_t) line.length();
+      if (len > N) len = N;
+      for (size_t j=0; j<len; ++j) row[j] = line.charAt(j);
+      lineasLeidas++;
     }
+    // Si llegan más líneas que M, simplemente las ignoramos (la biblioteca NO trunca internamente).
+  }
+
+  // Si faltaron líneas, rellenar filas restantes con espacios
+  while (lineasLeidas < M) {
+    char* row = matriz_texto + (lineasLeidas * N);
+    for (size_t j=0; j<N; ++j) row[j] = ' ';
+    lineasLeidas++;
+  }
+
+  // Traducir a matriz de puntos (3*M x 2*N)
+  size_t rows = M * 3;
+  size_t cols = N * 2;
+  uint8_t* braille = (uint8_t*) malloc(rows * cols);
+  if (!braille) {
+    Serial.println(F("Error: sin memoria para matriz_braille_bits."));
+    free(matriz_texto);
+    return;
+  }
+  traducirBraille(M, N, matriz_texto, braille);
+
+  // Imprimir matriz de puntos
+  Serial.println(F("== MATRIZ BRAILLE (3*M filas x 2*N cols) =="));
+  for (size_t r=0; r<rows; ++r) {
+    String line;
+    line.reserve(cols + N); // espacio extra para separadores
+    for (size_t c=0; c<cols; ++c) {
+      line += (braille[r*cols + c] ? '1' : '0');
+      // separador visual cada 2 columnas (limites de celda)
+      if ((c % 2)==1 && c+1 < cols) line += ' ';
+    }
+    Serial.println(line);
+  }
+  Serial.println(F("== FIN =="));
+
+  free(braille);
+  free(matriz_texto);
 }
